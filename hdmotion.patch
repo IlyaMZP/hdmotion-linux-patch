@@ -1,0 +1,297 @@
+--- a.cpp	2005-12-28 10:45:16.000000000 +0300
++++ b.cpp	2024-08-12 17:23:26.616165644 +0300
+@@ -14,154 +14,68 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <dos.h>
+ #include <time.h>
+-#include <conio.h>
+ #include <math.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/fs.h>
++#include <cstdint>
++#include <cerrno>
+ 
+ typedef int BOOL;
+ #define FALSE 0
+ #define TRUE (!FALSE)
+ 
+-/* -------------------------
+-   Extended INT 13H routines
+-   ------------------------- */
+-
+-void print_error(unsigned char code)
+-{
+-  const char *message;
+-
+-  switch(code)
+-  {
+-    case 0x01: message = "Invalid function"; break;
+-    case 0x02: message = "Address mark not found"; break;
+-    case 0x03: message = "Disk write protected"; break;
+-    case 0x04: message = "Sector not found"; break;
+-    case 0x07: message = "Drive parameter activity failed"; break;
+-    case 0x08: message = "DMA overrun"; break;
+-    case 0x09: message = "Data boundary error"; break;
+-    case 0x0A: message = "Bad sector detected"; break;
+-    case 0x0B: message = "Bad track detected"; break;
+-    case 0x0C: message = "Unsupported track or invalid media"; break;
+-    case 0x0E: message = "Control data address mark detected"; break;
+-    case 0x0F: message = "DMA arbitration level out of range"; break;
+-    case 0x10: message = "Uncorrectable CRC or ECC error on read"; break;
+-    case 0x11: message = "Data ECC corrected"; break;
+-    case 0x31: message = "No media in drive"; break;
+-    case 0x80: case 0xAA: message = "Drive not ready"; break;
+-    case 0xB3: message = "Volume in use"; break;
+-    case 0xCC: message = "Write fault"; break;
+-		case 0xE0: message = "Status register error"; break;
+-    case 0xFF: message = "Sense operation failed"; break;
+-    default: message = "Failure on INT 13";
+-  }
+-
+-  fprintf(stderr, "%02x %s\n", code, message);
+-}
+-
+-/* Test for INT 13 Extensions support */
+-BOOL support_13x(unsigned char drv_num)
+-{
+-  unsigned char version;
+-  unsigned short flags;
+-
+-  asm {
+-    mov ah, 0x41
+-    mov bx, 0x55AA
+-    mov dl, drv_num
+-    int 0x13
+-    jc error_0
+-    cmp bx, 0xAA55
+-    jnz error_0
+-    mov version, ah
+-    mov flags, cx
+-  }
+-
+-  if ( flags & 1 )
+-  {
+-    return TRUE;
+-  }
+-  else
+-  {
+-    return FALSE;
+-  }
+-
+-error_0:
+-  return FALSE;
+-}
+ 
+ /* Get the size and count of sectors on the drive */
+-BOOL get_drive_parameters(unsigned char drv_num, unsigned short *bytes_per_sector, unsigned long *sectors)
+-{
+-  const static size_t bufsize = 0x1E;
+-
+-  char parm_buf[bufsize];
+-  char far *pBuf = parm_buf;
+-  unsigned char error;
+-
+-  memset(pBuf, 0, bufsize);
+-  *(unsigned short *)pBuf = bufsize;
+-
+-  asm {
+-    mov ah,0x48
+-    mov dl,drv_num
+-    push ds
+-    lds si,pBuf
+-    int 0x13
+-    pop ds
+-    jc error_1
+-  }
+-
+-  *bytes_per_sector = *(unsigned short *)(pBuf + 0x18);
+-  *sectors = *(unsigned long *)(pBuf + 0x10);
+-
+-  return TRUE;
++BOOL get_drive_parameters(int fd, unsigned short *bytes_per_sector, unsigned long *sectors) {
++    // Get the size of a sector in bytes
++    if (ioctl(fd, BLKSSZGET, bytes_per_sector) < 0) {
++        fprintf(stderr, "Failed to get bytes per sector\n");
++        close(fd);
++        return FALSE;
++    }
+ 
+-error_1:
+-  asm {
+-    mov error,ah
+-  }
+-	print_error(error);
++    // Get the number of sectors
++    unsigned long long size_in_bytes;
++    if (ioctl(fd, BLKGETSIZE64, &size_in_bytes) < 0) {  // Use BLKGETSIZE64 to get size in bytes
++        fprintf(stderr, "Failed to get device size\n");
++        close(fd);
++        return FALSE;
++    }
+ 
+-  return FALSE;
++    *sectors = size_in_bytes / *bytes_per_sector;
++    return TRUE;
+ }
+ 
+ /* Transfer sectors */
+-BOOL xfer_sectors(unsigned char drv_num, BOOL write, unsigned long sector, unsigned short count, void far *buf)
++BOOL xfer_sectors(int fd, BOOL write, unsigned long sector, unsigned short sector_size, unsigned short count, void* buf)
+ {
++    uint64_t offset = sector * sector_size;
++    ssize_t bytes_to_transfer = count * sector_size;
++    ssize_t result;
++
++    if (write) {
++        // Perform a write operation
++        result = pwrite(fd, buf, bytes_to_transfer, offset);
++    } else {
++        // Perform a read operation
++        result = pread(fd, buf, bytes_to_transfer, offset);
++    }
+ 
+-  char addx[16];
+-  char far *pAddx = addx;
+-  unsigned char error;
+-
+-  unsigned char op = (write ? 0x43 : 0x42);
+-
+-  *(unsigned char *)(addx) = 16;
+-  *(unsigned char *)(addx + 1) = 0;
+-  *(unsigned short *)(addx + 2) = count;
+-  *(void far **)(addx + 4) = buf;
+-  *(unsigned long *)(addx + 8) = sector;
+-  *(unsigned long *)(addx + 12) = 0L;
+-
+-  asm {
+-    mov ah, op
+-    mov al, 0
+-    mov dl, drv_num
+-    push ds
+-    lds si, pAddx
+-    int 0x13
+-    pop ds
+-    jc error_2
+-  }
+-
+-  return TRUE;
++    if (result == -1) {
++        // An error occurred, print the error message for debugging
++        fprintf(stderr, "Error: %s\n", strerror(errno));
++        return FALSE;
++    }
+ 
+-error_2:
+-  asm {
+-    mov error, ah
+-  }
+-  print_error(error);
+-  return FALSE;
++    // Check if the number of bytes transferred matches the expected count
++    if (result != bytes_to_transfer) {
++        fprintf(stderr, "Error: Incomplete transfer. Transferred %ld bytes, expected %ld bytes.", result, bytes_to_transfer);
++        return FALSE;
++    }
++    return TRUE;
+ }
+ 
+ /* -------------------------
+@@ -172,7 +86,7 @@
+ {
+ public:
+   hdmotion() :
+-  	drvnum(0),
++  	drvnum(-1),
+     bytes_per_sector(0),
+     capacity(0),
+     buf_sectors(0),
+@@ -184,19 +98,16 @@
+   ~hdmotion()
+   {
+   	if ( buf )
+-    	delete [] buf;
++    	delete [] (char*)buf;
+   }
+ 
+-	BOOL open_drive(unsigned char drvnum_)
++	BOOL open_drive(const char *device_)
+   {
+-  	drvnum = drvnum_;
+-
+-	  if ( !support_13x(drvnum) )
+-	  {
+-	  	fprintf(stderr, "Drive not present or INT 13 Extensions not supported\n");
+-	    return FALSE;
+-	  }
+-
++  	drvnum = open(device_, O_RDONLY | O_DIRECT);
++    if (drvnum < 0) {
++        perror("Failed to open device");
++        return FALSE;
++    }
+   	if ( !get_drive_parameters(drvnum, &bytes_per_sector, &capacity) )
+ 	  {
+ 	    fprintf(stderr, "Failed to query drive capacity\n");
+@@ -205,11 +116,12 @@
+ 
+ 		buf_sectors = 65535 / bytes_per_sector;
+     bufsize = buf_sectors * bytes_per_sector;
+-    buf = new unsigned char[bufsize];
+-    if ( !buf )
+-    {
+-    	fprintf(stderr, "Failed to allocate sector buffer.  DOS sucks.\n");
+-      return FALSE;
++
++    int alignment = bytes_per_sector; // Align to sector size
++    if (posix_memalign(&buf, alignment, bufsize) != 0) {
++        fprintf(stderr, "posix_memalign failed\n");
++        close(drvnum);
++        return FALSE;
+     }
+ 
+     set_chunk(1);
+@@ -233,20 +145,17 @@
+ 		puts(linebuf);
+ 
+     unsigned long start_sec = (unsigned long)(position * (capacity - chunk));
+-		xfer_sectors(drvnum, FALSE, start_sec, chunk, buf);
+-
+-		if ( kbhit() && (getch() == 27) )
+-    	exit(0);
++		xfer_sectors(drvnum, FALSE, start_sec, bytes_per_sector, chunk, buf);
+   }
+ 
+ private:
+-	unsigned char drvnum;
++	int drvnum;
+   unsigned short bytes_per_sector;
+   unsigned long capacity;
+   unsigned int buf_sectors;
+   unsigned int chunk;
+   size_t bufsize;
+-  unsigned char *buf;
++  void *buf;
+ };
+ 
+ /* -------------------------
+@@ -258,13 +167,13 @@
+ {
+   if (argc < 2)
+   {
+-  	fprintf(stderr, "Please specify a drive number (0x80, 0x81, etc...)\n");
++  	fprintf(stderr, "Please specify the device path (/dev/sda, /dev/sdb, etc...)\n");
+     return 1;
+   }
+ 
+-	unsigned char drvnum = (unsigned char)strtoul(argv[1], NULL, 0);
++	const char *device = argv[1];
+   hdmotion D;
+-  if ( !D.open_drive(drvnum) )
++  if ( !D.open_drive(device) )
+   	return 1;
+ 
+ 
